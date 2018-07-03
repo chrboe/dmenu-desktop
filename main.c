@@ -1,6 +1,6 @@
 /*
  * main.c
- * Copyright (C) 2018 christoph <christoph@localhost>
+ * Copyright (C) 2018 christoph <christoph@boehmwalder.at>
  *
  * Distributed under terms of the GPLv3 license.
  */

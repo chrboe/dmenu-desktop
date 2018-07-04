@@ -1,6 +1,6 @@
 /*
  * main.c
- * Copyright (C) 2018 christoph <christoph@boehmwalder.at>
+ * Copyright (C) 2018 Christoph Böhmwalder <christoph@boehmwalder.at>
  *
  * Distributed under terms of the GPLv3 license.
  */
@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 
+#include "desktop.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,108 +20,11 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 
-#define KEY_TYPE "Type="
-#define KEY_TYPE_LEN (sizeof(KEY_TYPE) - 1)
-
-#define KEY_NAME "Name="
-#define KEY_NAME_LEN (sizeof(KEY_NAME) - 1)
-
-#define KEY_EXEC "Exec="
-#define KEY_EXEC_LEN (sizeof(KEY_EXEC) - 1)
-
-#define KEY_NO_DISPLAY "NoDisplay="
-#define KEY_NO_DISPLAY_LEN (sizeof(KEY_NO_DISPLAY) -1)
-
 struct user_choice
 {
     char *name;
     char *exec;
 };
-
-/* returns:
- *  * 0 on success
- *  * -1 on error
- *  * -2 on skip
- */
-int parse_desktop_file(char *path, struct user_choice *result)
-{
-    FILE *fp;
-    char *line = malloc(64);
-    size_t len = 0;
-    ssize_t read;
-    bool in_group = false;
-    bool exec_found = false, name_found = false;
-    size_t valuelen;
-
-    fp = fopen(path, "r");
-
-    while ((read = getline(&line, &len, fp)) != -1) {
-        if (!in_group) {
-            /* scan for the [Desktop Entry] group */
-            if (strcmp(line, "[Desktop Entry]\n") != 0) {
-                continue;
-            }
-
-            in_group = true;
-            continue;
-        }
-
-        /* check that we aren't entering any other group */
-        if (line[0] == '[') {
-            break;
-        }
-
-        /* Type= */
-        if (strncmp(line, KEY_TYPE, KEY_TYPE_LEN) == 0) {
-            if (strcmp(line + KEY_TYPE_LEN, "Application\n") != 0) {
-                /* type is not application, quit */
-                return -2;
-            }
-        }
-
-        /* Name= */
-        if (strncmp(line, KEY_NAME, KEY_NAME_LEN) == 0) {
-            /* TODO: localization? */
-            valuelen = strlen(line) - KEY_NAME_LEN;
-
-            /* copy one less byte because of the newline */
-            strncpy(result->name, line + KEY_NAME_LEN, valuelen - 1);
-            result->name[valuelen - 1] = '\0';
-            name_found = true;
-        }
-
-        /* Exec= */
-        if (strncmp(line, KEY_EXEC, KEY_EXEC_LEN) == 0) {
-            valuelen = strlen(line) - KEY_EXEC_LEN;
-
-            /* copy one less byte because of the newline */
-            strncpy(result->exec, line + KEY_EXEC_LEN, valuelen - 1);
-            result->exec[valuelen - 1] = '\0';
-            exec_found = true;
-        }
-
-        /* NoDisplay= */
-        if (strncmp(line, KEY_NO_DISPLAY, KEY_NO_DISPLAY_LEN) == 0) {
-            if (strcmp(line + KEY_NO_DISPLAY_LEN, "true\n") == 0) {
-                /* skip NoDisplay=true */
-                return -2;
-            }
-        }
-    }
-
-    /* didn't find the group header */
-    if (!in_group)
-        return -1;
-
-    /* invalid desktop file */
-    if (!name_found || !exec_found)
-        return -1;
-
-    free(line);
-    fclose(fp);
-
-    return 0;
-}
 
 bool contains_name(struct user_choice ***choices, size_t index, char *name)
 {
@@ -133,6 +37,164 @@ bool contains_name(struct user_choice ***choices, size_t index, char *name)
     return false;
 }
 
+void handle_field_codes(char *exec, char **buf, size_t bufsiz)
+{
+    size_t bufpos = 0;
+    char *p = exec;
+    while(*p) {
+        switch(*p) {
+            case '%':
+                p++;
+                /* BIG TODO: actually handle codes instead of skipping them */
+                break;
+            default:
+                (*buf)[bufpos++] = *p;
+                break;
+        }
+        p++;
+    }
+
+    (*buf)[bufpos] = '\0';
+}
+
+static int populate_choice(struct user_choice *choice, struct desktop_file *file)
+{
+    int i, j;
+    struct desktop_group *group;
+    struct desktop_entry *entry;
+    bool name_found = false, exec_found = false;
+
+    for (i = 0; i < file->group_count; i++) {
+        group = &file->groups[i];
+
+        /* we're only interested in the [Desktop Entry] group */
+        if (strcmp("Desktop Entry", group->name) != 0) {
+            continue;
+        }
+
+        for (j = 0; j < group->entry_count; j++) {
+            entry = &group->entries[j];
+
+            /* if type isn't Application, skip */
+            if (strcmp("Type", entry->key) == 0 &&
+                    strcmp("Application", entry->value) != 0) {
+                return -2;
+            }
+
+            /* copy name */
+            if (strcmp("Name", entry->key) == 0) {
+                strcpy(choice->name, entry->value);
+                name_found = true;
+            }
+
+            /* copy exec */
+            if (strcmp("Exec", entry->key) == 0) {
+                strcpy(choice->exec, entry->value);
+                exec_found = true;
+            }
+
+            /* TODO: implement TryExec */
+        }
+
+        /* parse only the Desktop Entry group for now */
+        break;
+    }
+
+    if (!name_found || !exec_found) {
+        /* name AND exec are required */
+        return -1;
+    }
+
+    /*printf("new user choice. name: %s, exec: %s\n", choice->name, choice->exec);*/
+
+    return 0;
+}
+
+/*
+ * return:
+ *    * 0 on success
+ *    * -1 on error
+ *    * -2 on skip
+ */
+static int search_directory(char *parent_dir, DIR *d,
+        struct user_choice ***choices, size_t *choice_index, size_t *choices_len)
+{
+    char *fnametmp;
+    int rc;
+    char current_abspath[PATH_MAX];
+    struct desktop_file file;
+    struct dirent *dir;
+    int error = 0;
+
+    while ((dir = readdir(d)) != NULL) {
+        /* only handle regular files (TODO: symlinks too?) */
+        if (dir->d_type != DT_REG) {
+            continue;
+        }
+
+        /* check if it ends with ".desktop" */
+        fnametmp = strrchr(dir->d_name, '.');
+        if (!fnametmp || strcmp(fnametmp, ".desktop") != 0) {
+            continue;
+        }
+
+        snprintf(current_abspath, PATH_MAX, "%s%s", parent_dir, dir->d_name);
+
+        struct user_choice *choice = malloc(sizeof(struct user_choice));
+        choice->name = malloc(256);
+        choice->exec = malloc(256);
+
+        init_desktop_file(&file);
+        rc = parse_desktop_file(current_abspath, &file);
+
+        if (rc == -1) {
+            /* error */
+            free(choice->name);
+            free(choice->exec);
+            free(choice);
+
+            free_desktop_file(&file);
+            printf("error %d on file %s\n", rc, current_abspath);
+            continue;
+        }
+
+        if (contains_name(choices, *choice_index, choice->name)) {
+            /* skip duplicate names */
+            free(choice->name);
+            free(choice->exec);
+            free(choice);
+
+            free_desktop_file(&file);
+            printf("duplicate name: ignoring file %s\n", current_abspath);
+            continue;
+        }
+
+        rc = populate_choice(choice, &file);
+
+        if (rc != 0) {
+            free(choice->name);
+            free(choice->exec);
+            free(choice);
+
+            free_desktop_file(&file);
+            continue;
+        } else {
+            (*choices)[*choice_index] = choice;
+            (*choice_index)++;
+        }
+
+        /* check if list is too small */
+        if (*choice_index >= *choices_len) {
+            *choices_len *= 2;
+            *choices = realloc(*choices, *choices_len);
+        }
+
+        free_desktop_file(&file);
+    }
+
+    return error;
+}
+
 /*
  * returns:
  *    * number of written entries on success
@@ -143,13 +205,9 @@ int search_desktop_files(struct user_choice ***choices)
     char *data_home, *data_dirs;
     int offs;
     DIR *d;
-    struct dirent *dir;
-    char *fnametmp;
     char *token;
-    char current_abspath[PATH_MAX];
     size_t choice_index = 0;
     size_t choices_len = 64;
-    int rc;
 
     /* get search directories */
     data_home = getenv("XDG_DATA_HOME");
@@ -173,49 +231,7 @@ int search_desktop_files(struct user_choice ***choices)
     while (token != NULL) {
         d = opendir(token);
         if (d) {
-            while ((dir = readdir(d)) != NULL) {
-                fnametmp = NULL;
-
-                /* only handle regular files (TODO: symlinks too?) */
-                if (dir->d_type != DT_REG)
-                    continue;
-
-                /* check if it ends with ".desktop" */
-                fnametmp = strrchr(dir->d_name, '.');
-                if (!fnametmp || strcmp(fnametmp, ".desktop") != 0)
-                    continue;
-
-                snprintf(current_abspath, PATH_MAX, "%s%s", token, dir->d_name);
-
-                struct user_choice *choice = malloc(sizeof(struct user_choice));
-                choice->name = malloc(256);
-                choice->exec = malloc(256);
-                rc = parse_desktop_file(current_abspath, choice);
-                if (rc == -1 ||  rc == -2) {
-                    /* error or not interesting */
-                    free(choice->name);
-                    free(choice->exec);
-                    free(choice);
-                    continue;
-                }
-
-                if (contains_name(choices, choice_index, choice->name)) {
-                    /* skip duplicate names */
-                    free(choice->name);
-                    free(choice->exec);
-                    free(choice);
-                    continue;
-                }
-
-                (*choices)[choice_index] = choice;
-                choice_index++;
-
-                /* check if list is too small */
-                if (choice_index >= choices_len) {
-                    choices_len *= 2;
-                    *choices = realloc(*choices, choices_len);
-                }
-            }
+            search_directory(token, d, choices, &choice_index, &choices_len);
             closedir(d);
         }
 
@@ -223,26 +239,6 @@ int search_desktop_files(struct user_choice ***choices)
     }
 
     return choice_index;
-}
-
-void handle_field_codes(char *exec, char **buf, size_t bufsiz)
-{
-    size_t bufpos = 0;
-    char *p = exec;
-    while(*p) {
-        switch(*p) {
-            case '%':
-                p++;
-                /* BIG TODO: actually handle codes instead of skipping them */
-                break;
-            default:
-                (*buf)[bufpos++] = *p;
-                break;
-        }
-        p++;
-    }
-
-    (*buf)[bufpos] = '\0';
 }
 
 void find_and_exec(struct user_choice **choices, size_t num, char *got)
@@ -323,10 +319,10 @@ void free_choices(struct user_choice **choices, size_t len)
 
 int main(int argc, char **argv)
 {
-    struct user_choice **choices;
-    int written;
+       struct user_choice **choices;
+       int written;
 
-    written = search_desktop_files(&choices);
-    launch_dmenu(choices, written);
-    free_choices(choices, written);
+       written = search_desktop_files(&choices);
+       launch_dmenu(choices, written);
+       free_choices(choices, written);
 }

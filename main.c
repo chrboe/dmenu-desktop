@@ -415,7 +415,6 @@ int main(int argc, char **argv)
         printf("rebuilding cache\n");
         written = search_desktop_files(&choices);
         cache_write(cache_fp, choices, written);
-        fflush(cache_fp);
         printf("cache written\n");
     }
 

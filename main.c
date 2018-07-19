@@ -10,7 +10,9 @@
  */
 #define _GNU_SOURCE
 
+#include "dmenu-desktop.h"
 #include "desktop.h"
+#include "cache.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,12 +21,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-
-struct user_choice
-{
-    char *name;
-    char *exec;
-};
+#include <errno.h>
+#include <sys/stat.h>
 
 bool contains_name(struct user_choice ***choices, size_t index, char *name)
 {
@@ -117,7 +115,8 @@ static int populate_choice(struct user_choice *choice, struct desktop_file *file
  *    * -2 on skip
  */
 static int search_directory(char *parent_dir, DIR *d,
-        struct user_choice ***choices, size_t *choice_index, size_t *choices_len)
+        struct user_choice ***choices, size_t *choice_index,
+        size_t *choices_len)
 {
     char *fnametmp;
     int rc;
@@ -278,7 +277,7 @@ void launch_dmenu(struct user_choice **choices, size_t num)
         close(in_fd[1]);
         close(out_fd[0]);
         close(out_fd[1]);
-        execl("/usr/bin/dmenu", "dmenu", "-i", (char *)NULL);
+        execl("/usr/bin/dmenu", "dmenu", "-i", "-f", (char *)NULL);
         exit(0);
     } else {
         int imode = 0;
@@ -317,12 +316,112 @@ void free_choices(struct user_choice **choices, size_t len)
     free(choices);
 }
 
+static FILE *fopen_cache(char **cache_file, bool *created)
+{
+    char cache_dir[PATH_MAX];
+    char *xdg_cache_home;
+    int mkdir_rc;
+    DIR *d;
+    FILE *cache_fp;
+
+    xdg_cache_home = getenv("XDG_CACHE_HOME");
+    if (xdg_cache_home)
+        snprintf(cache_dir, PATH_MAX, "%s/%s", xdg_cache_home, CACHE_DIRNAME);
+    else
+        snprintf(cache_dir, PATH_MAX, "%s/%s/%s", getenv("HOME"), ".cache",
+                CACHE_DIRNAME);
+
+    /* try to change to cache directory */
+    do
+    {
+        d = opendir(cache_dir);
+        if (d) {
+            /* success */
+            closedir(d);
+            break;
+        }
+
+        if (errno == ENOENT) {
+            /* directory doesn't exist, try to create it */
+            mkdir_rc = mkdir(cache_dir, S_IRUSR | S_IWUSR | S_IXUSR);
+            if (mkdir_rc == -1) {
+                perror("cache mkdir");
+                return NULL;
+            }
+            /* try again */
+            continue;
+        }
+
+        /* other error */
+        perror("cache chdir");
+        return NULL;
+    } while(!d);
+
+    sprintf(*cache_file, "%s/%s", cache_dir, CACHE_FILENAME);
+
+    /* create the file if it doesn't exist */
+    cache_fp = fopen(*cache_file, "r+");
+    if (cache_fp) {
+        /* success, file already existed */
+        *created = false;
+        return cache_fp;
+    }
+
+    if (errno == ENOENT) {
+        cache_fp = fopen(*cache_file, "ab+");
+        *created = true;
+        if (!cache_fp) {
+            perror("cache fopen");
+            return NULL;
+        }
+    }
+
+    return cache_fp;
+}
+
 int main(int argc, char **argv)
 {
-       struct user_choice **choices;
-       int written;
+    struct user_choice **choices;
+    int written;
+    int check_rc;
+    FILE *cache_fp;
+    bool created;
+    bool cache_rebuild;
+    char *cache_file = malloc(PATH_MAX);
 
-       written = search_desktop_files(&choices);
-       launch_dmenu(choices, written);
-       free_choices(choices, written);
+    cache_fp = fopen_cache(&cache_file, &created);
+
+    cache_rebuild = false;
+    if (!created) {
+        check_rc = cache_check(cache_file);
+        if (check_rc == 0) {
+            /* use cache */
+            printf("using cache file %s\n", cache_file);
+            written = cache_read(cache_fp, &choices);
+
+            /*
+             * if there were no entries in the cache, we'll just assume
+             * it's broken and rebuild it.
+             */
+            if (written == 0) {
+                cache_rebuild = true;
+            }
+        } else {
+            cache_rebuild = true;
+        }
+    }
+
+    if (cache_rebuild) {
+        printf("rebuilding cache\n");
+        written = search_desktop_files(&choices);
+        cache_write(cache_fp, choices, written);
+        fflush(cache_fp);
+        printf("cache written\n");
+    }
+
+    fclose(cache_fp);
+    free(cache_file);
+
+    launch_dmenu(choices, written);
+    free_choices(choices, written);
 }
